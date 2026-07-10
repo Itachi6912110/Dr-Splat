@@ -72,20 +72,24 @@ def write_bev(path, query, threshold, xyz_np, hit_np, act_np, cluster_np, lo_np,
     plt.close(fig)
 
 
-def write_html(path, xyz, colors, activated, query, stats):
+def write_html(path, xyz, colors, rgb_true, activated, query, stats, bbox_lo, bbox_hi):
     pos = xyz.astype(np.float32)
     center = pos.mean(axis=0)
     pos -= center
     radius = float(np.percentile(np.linalg.norm(pos, axis=1), 95))
     b64_pos = base64.b64encode(pos.tobytes()).decode()
     b64_col = base64.b64encode(colors.astype(np.uint8).tobytes()).decode()
+    b64_rgb = base64.b64encode(rgb_true.astype(np.uint8).tobytes()).decode()
     b64_act = base64.b64encode(activated.astype(np.uint8).tobytes()).decode()
     obj_center = (stats["centroid"] - center).tolist()
+    fmt = lambda v: "[" + ",".join(f"{x:.4f}" for x in v) + "]"
     html = HTML_TEMPLATE
     for key, val in [("__QUERY__", query), ("__NPTS__", str(pos.shape[0])),
                      ("__NACT__", str(stats["count"])), ("__RADIUS__", f"{radius:.4f}"),
-                     ("__OBJ__", "[" + ",".join(f"{v:.4f}" for v in obj_center) + "]"),
-                     ("__POS__", b64_pos), ("__COL__", b64_col), ("__ACT__", b64_act)]:
+                     ("__OBJ__", fmt(obj_center)),
+                     ("__BLO__", fmt(bbox_lo - center)), ("__BHI__", fmt(bbox_hi - center)),
+                     ("__POS__", b64_pos), ("__COL__", b64_col), ("__RGB__", b64_rgb),
+                     ("__ACT__", b64_act)]:
         html = html.replace(key, val)
     with open(path, "w") as f:
         f.write(html)
@@ -104,32 +108,47 @@ HTML_TEMPLATE = r"""<meta charset="utf-8"><title>Dr-Splat 3D localization</title
   query: <b>__QUERY__</b><br>
   <span class="dim">__NACT__ / __NPTS__ Gaussians activated</span><br>
   <label><input type="checkbox" id="only"> show activated only</label><br>
+  <label><input type="checkbox" id="truecol"> true colors</label><br>
+  <label><input type="checkbox" id="bbox" checked> show 3D bounding box</label><br>
   <span class="dim">drag: orbit &nbsp; wheel: zoom &nbsp; shift-drag: pan</span>
 </div>
 <canvas id="c"></canvas>
 <script>
 const B=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
-const pos=new Float32Array(B("__POS__").buffer), col=B("__COL__"), act=B("__ACT__");
-const N=__NPTS__, R=__RADIUS__, OBJ=__OBJ__;
+const pos=new Float32Array(B("__POS__").buffer), col=B("__COL__"), rgb=B("__RGB__"), act=B("__ACT__");
+const N=__NPTS__, R=__RADIUS__, OBJ=__OBJ__, BLO=__BLO__, BHI=__BHI__;
 const cv=document.getElementById("c"), gl=cv.getContext("webgl");
-const vs=`attribute vec3 p;attribute vec3 c;attribute float a;uniform mat4 mvp;uniform float ps;uniform float onlyAct;
+const vs=`attribute vec3 p;attribute vec3 c;attribute vec3 c2;attribute float a;
+uniform mat4 mvp;uniform float ps;uniform float onlyAct;uniform float trueCol;
 varying vec3 vc;varying float va;
 void main(){gl_Position=mvp*vec4(p,1.);float w=max(gl_Position.w,.01);gl_PointSize=clamp(ps/w,1.,8.);
-vc=c;va=a;if(onlyAct>.5&&a<.5)gl_Position=vec4(2e9,2e9,2e9,1.);}`;
-const fs=`precision mediump float;varying vec3 vc;varying float va;
-void main(){vec2 d=gl_PointCoord-vec2(.5);if(dot(d,d)>.25)discard;gl_FragColor=vec4(vc,1.);}`;
+vc=mix(c,c2,trueCol);va=a;if(onlyAct>.5&&a<.5)gl_Position=vec4(2e9,2e9,2e9,1.);}`;
+const fs=`precision mediump float;varying vec3 vc;varying float va;uniform float isLine;
+void main(){if(isLine<.5){vec2 d=gl_PointCoord-vec2(.5);if(dot(d,d)>.25)discard;}gl_FragColor=vec4(vc,1.);}`;
 function sh(t,s){const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);
 if(!gl.getShaderParameter(o,gl.COMPILE_STATUS))throw gl.getShaderInfoLog(o);return o;}
 const pr=gl.createProgram();gl.attachShader(pr,sh(gl.VERTEX_SHADER,vs));gl.attachShader(pr,sh(gl.FRAGMENT_SHADER,fs));
 gl.linkProgram(pr);gl.useProgram(pr);
-function buf(data,attr,size,type,norm){const b=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,b);
-gl.bufferData(gl.ARRAY_BUFFER,data,gl.STATIC_DRAW);const l=gl.getAttribLocation(pr,attr);
+function mkbuf(data){const b=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,b);
+gl.bufferData(gl.ARRAY_BUFFER,data,gl.STATIC_DRAW);return b;}
+function attrib(b,name,size,type,norm){gl.bindBuffer(gl.ARRAY_BUFFER,b);const l=gl.getAttribLocation(pr,name);
 gl.enableVertexAttribArray(l);gl.vertexAttribPointer(l,size,type,norm,0,0);}
-buf(pos,"p",3,gl.FLOAT,false);buf(col,"c",3,gl.UNSIGNED_BYTE,true);
-buf(Float32Array.from(act),"a",1,gl.FLOAT,false);
-const uMVP=gl.getUniformLocation(pr,"mvp"),uPS=gl.getUniformLocation(pr,"ps"),uOnly=gl.getUniformLocation(pr,"onlyAct");
-let yaw=.6,pitch=.4,dist=2.2*R,tx=OBJ[0],ty=OBJ[1],tz=OBJ[2],only=0;
+const bP=mkbuf(pos),bC=mkbuf(col),bC2=mkbuf(rgb),bA=mkbuf(Float32Array.from(act));
+// wireframe bbox: 12 edges from the dominant-cluster min/max corners
+const E=[[0,0,0,1,0,0],[0,0,0,0,1,0],[0,0,0,0,0,1],[1,1,0,0,1,0],[1,1,0,1,0,0],[1,1,0,1,1,1],
+[1,0,1,0,0,1],[1,0,1,1,0,0],[1,0,1,1,1,1],[0,1,1,0,0,1],[0,1,1,0,1,0],[0,1,1,1,1,1]];
+const boxPos=new Float32Array(E.flat().map((t,i)=>{const ax=i%3;return t?BHI[ax]:BLO[ax];}));
+const NBOX=boxPos.length/3;
+const boxCol=new Uint8Array(NBOX*3);for(let i=0;i<NBOX;i++){boxCol[i*3]=255;boxCol[i*3+1]=45;boxCol[i*3+2]=45;}
+const bBP=mkbuf(boxPos),bBC=mkbuf(boxCol),bBA=mkbuf(new Float32Array(NBOX).fill(1));
+const uMVP=gl.getUniformLocation(pr,"mvp"),uPS=gl.getUniformLocation(pr,"ps"),
+uOnly=gl.getUniformLocation(pr,"onlyAct"),uTrue=gl.getUniformLocation(pr,"trueCol"),
+uLine=gl.getUniformLocation(pr,"isLine");
+const BD=Math.hypot(BHI[0]-BLO[0],BHI[1]-BLO[1],BHI[2]-BLO[2]);
+let yaw=.6,pitch=.4,dist=Math.max(2.5*BD,.15*R),tx=OBJ[0],ty=OBJ[1],tz=OBJ[2],only=0,truec=0,box=1;
 document.getElementById("only").onchange=e=>{only=e.target.checked?1:0;};
+document.getElementById("truecol").onchange=e=>{truec=e.target.checked?1:0;};
+document.getElementById("bbox").onchange=e=>{box=e.target.checked?1:0;};
 let drag=0,px=0,py=0;
 cv.onmousedown=e=>{drag=e.shiftKey?2:1;px=e.clientX;py=e.clientY;};
 window.onmouseup=()=>drag=0;
@@ -152,8 +171,16 @@ function frame(){const dpr=window.devicePixelRatio||1;
 if(cv.width!==cv.clientWidth*dpr||cv.height!==cv.clientHeight*dpr){cv.width=cv.clientWidth*dpr;cv.height=cv.clientHeight*dpr;}
 gl.viewport(0,0,cv.width,cv.height);gl.clearColor(.07,.07,.08,1);gl.enable(gl.DEPTH_TEST);
 gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
-gl.uniformMatrix4fv(uMVP,false,mat());gl.uniform1f(uPS,cv.height*.0035*R);gl.uniform1f(uOnly,only);
-gl.drawArrays(gl.POINTS,0,N);requestAnimationFrame(frame);}
+gl.uniformMatrix4fv(uMVP,false,mat());gl.uniform1f(uPS,cv.height*.0035*R);
+gl.uniform1f(uOnly,only);gl.uniform1f(uTrue,truec);gl.uniform1f(uLine,0);
+attrib(bP,"p",3,gl.FLOAT,false);attrib(bC,"c",3,gl.UNSIGNED_BYTE,true);
+attrib(bC2,"c2",3,gl.UNSIGNED_BYTE,true);attrib(bA,"a",1,gl.FLOAT,false);
+gl.drawArrays(gl.POINTS,0,N);
+if(box){gl.uniform1f(uLine,1);gl.uniform1f(uTrue,0);gl.uniform1f(uOnly,0);
+attrib(bBP,"p",3,gl.FLOAT,false);attrib(bBC,"c",3,gl.UNSIGNED_BYTE,true);
+attrib(bBC,"c2",3,gl.UNSIGNED_BYTE,true);attrib(bBA,"a",1,gl.FLOAT,false);
+gl.drawArrays(gl.LINES,0,NBOX);}
+requestAnimationFrame(frame);}
 frame();
 </script>
 """
@@ -188,6 +215,7 @@ if __name__ == "__main__":
     keep = opacity > args.opacity_min
     xyz_np = xyz[keep].cpu().numpy()
     base = (rgb[keep].cpu().numpy() * 0.35 + 0.45) * 255.0  # desaturated scene
+    true_rgb = rgb[keep].cpu().numpy() * 255.0
     out_dir = os.path.join(args.model_path, "localize_3d")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -250,5 +278,6 @@ if __name__ == "__main__":
             else:
                 sel = np.arange(xyz_np.shape[0])
             html_path = os.path.join(out_dir, f"{tag}.html")
-            write_html(html_path, xyz_np[sel], colors[sel], hit_np[sel], query, stats)
+            write_html(html_path, xyz_np[sel], colors[sel], true_rgb[sel], hit_np[sel], query, stats,
+                       lo.cpu().numpy(), hi.cpu().numpy())
             print(f"  wrote {html_path} ({sel.shape[0]} points)")
