@@ -153,8 +153,8 @@ let drag=0,px=0,py=0;
 cv.onmousedown=e=>{drag=e.shiftKey?2:1;px=e.clientX;py=e.clientY;};
 window.onmouseup=()=>drag=0;
 window.onmousemove=e=>{if(!drag)return;const dx=e.clientX-px,dy=e.clientY-py;px=e.clientX;py=e.clientY;
-if(drag==1){yaw+=dx*.005;pitch=Math.max(-1.55,Math.min(1.55,pitch+dy*.005));}
-else{const s=dist*.0012;tx-=s*(dx*Math.cos(yaw)-0);tz-=s*(dx*Math.sin(yaw));ty+=s*dy;}};
+if(drag==1){yaw-=dx*.005;pitch=Math.max(-1.55,Math.min(1.55,pitch+dy*.005));}
+else{const s=dist*.0012;tx-=s*dx*Math.cos(yaw);tz+=s*dx*Math.sin(yaw);ty+=s*dy;}};
 cv.onwheel=e=>{e.preventDefault();dist*=Math.pow(1.1,e.deltaY>0?1:-1);dist=Math.max(.05*R,Math.min(20*R,dist));};
 function mat(){const cw=cv.clientWidth,ch=cv.clientHeight,ar=cw/ch,f=1.6,zn=.01*R,zf=60*R;
 const cp=Math.cos(pitch),sp=Math.sin(pitch),cy=Math.cos(yaw),sy=Math.sin(yaw);
