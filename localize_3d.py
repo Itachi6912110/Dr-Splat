@@ -1,24 +1,28 @@
 #
 # 3D object localization directly on the Gaussians — no cameras, no rasterization.
 # Loads a Dr-Splat checkpoint (chkpnt0.pth), PQ-decodes each Gaussian's registered
-# CLIP embedding, scores it against a text query, and reports the object's 3D
-# centroid / bounding box. Optionally writes a heatmap-colored point cloud (PLY)
-# and a self-contained interactive HTML viewer.
+# CLIP embedding, scores it against one or more text queries, and reports each
+# object's 3D centroid / bounding box. Optionally writes a bird-eye-view png, a
+# heatmap-colored point cloud (PLY), and a self-contained interactive HTML viewer.
 #
 # Usage:
 #   python localize_3d.py -m output/teatime_1_pq_openclip_topk45_weight_128 \
-#       --pq_index ckpts/pq_index.faiss --img_label "teddy bear" --threshold 0.6
+#       --pq_index ckpts/pq_index.faiss --threshold 0.6 \
+#       --img_label "teddy bear" "sheep" "coffee mug"
 #
 import os
 import time
 import base64
-import struct
 from argparse import ArgumentParser
 
 import faiss
 import numpy as np
 import torch
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from matplotlib import cm
+from matplotlib.patches import Rectangle
 from plyfile import PlyData, PlyElement
 
 from evaluation.openclip_encoder import OpenCLIPNetwork
@@ -43,6 +47,29 @@ def write_ply(path, xyz, colors):
     data["x"], data["y"], data["z"] = xyz[:, 0], xyz[:, 1], xyz[:, 2]
     data["red"], data["green"], data["blue"] = colors[:, 0], colors[:, 1], colors[:, 2]
     PlyData([PlyElement.describe(data, "vertex")]).write(path)
+
+
+def write_bev(path, query, threshold, xyz_np, hit_np, act_np, cluster_np, lo_np, hi_np, c_np):
+    scene = xyz_np[~hit_np]
+    obj = xyz_np[hit_np][cluster_np]
+    fig, ax = plt.subplots(figsize=(8, 8))
+    sub = np.random.default_rng(0).choice(scene.shape[0], min(200000, scene.shape[0]), replace=False)
+    ax.scatter(scene[sub, 0], scene[sub, 2], s=0.3, c="0.75", linewidths=0, rasterized=True)
+    ax.scatter(obj[:, 0], obj[:, 2], s=0.6, c=act_np[hit_np][cluster_np],
+               cmap="turbo", vmin=threshold, vmax=1.0, linewidths=0)
+    ax.add_patch(Rectangle((lo_np[0], lo_np[2]), hi_np[0] - lo_np[0], hi_np[2] - lo_np[2],
+                           fill=False, edgecolor="red", linewidth=1.5))
+    ax.plot(c_np[0], c_np[2], "r+", markersize=12, markeredgewidth=2)
+    ax.set_aspect("equal")
+    # zoom to the object with context (unbounded scenes have background floaters far away)
+    half = max(float(hi_np[0] - lo_np[0]), float(hi_np[2] - lo_np[2])) * 1.8
+    ax.set_xlim(c_np[0] - half, c_np[0] + half)
+    ax.set_ylim(c_np[2] - half, c_np[2] + half)
+    ax.set_xlabel("x")
+    ax.set_ylabel("z")
+    ax.set_title(f'bird-eye view: "{query}" ({cluster_np.sum()} Gaussians, thr {threshold})')
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
 def write_html(path, xyz, colors, activated, query, stats):
@@ -136,7 +163,8 @@ if __name__ == "__main__":
     parser = ArgumentParser(description="Text-query 3D localization directly on Gaussians")
     parser.add_argument("-m", "--model_path", type=str, required=True)
     parser.add_argument("--pq_index", type=str, required=True)
-    parser.add_argument("--img_label", type=str, required=True)
+    parser.add_argument("--img_label", type=str, nargs="+", required=True,
+                        help="one or more text queries; model/index load once, each query is scored in-loop")
     parser.add_argument("--threshold", type=float, default=0.6)
     parser.add_argument("--opacity_min", type=float, default=0.1)
     parser.add_argument("--html_points", type=int, default=400000)
@@ -147,95 +175,80 @@ if __name__ == "__main__":
     xyz, rgb, opacity, codes = load_gaussians(args.model_path)
     index = faiss.read_index(args.pq_index)
     clip_model = OpenCLIPNetwork("cuda")
-    clip_model.set_positives([args.img_label])
+    clip_model.set_positives(args.img_label)
 
-    # --- the 3D-native query: PQ decode + CLIP scoring, no rasterization ---
+    # PQ decode is query-independent — do it once for all queries
     torch.cuda.synchronize()
     t0 = time.time()
     valid = ~torch.all(codes == -1, dim=-1)
     embeds = torch.from_numpy(index.sa_decode(codes[valid].cpu().numpy())).cuda()
-    activation = torch.zeros(codes.shape[0], device="cuda")
-    activation[valid] = clip_model.get_activation(embeds, 0).squeeze(-1)
     torch.cuda.synchronize()
-    query_time = time.time() - t0
+    print(f"decoded {int(valid.sum())} of {codes.shape[0]} Gaussian embeddings in {time.time() - t0:.2f} s")
 
-    hit = (activation > args.threshold) & (opacity > args.opacity_min)
-    n_hit = int(hit.sum())
-    print(f"query '{args.img_label}': scored {int(valid.sum())} Gaussians in {query_time*1000:.1f} ms "
-          f"(no rasterization), {n_hit} above threshold {args.threshold}")
-    if n_hit == 0:
-        raise SystemExit("no Gaussians activated — lower --threshold")
-
-    # sigma-clip to the dominant cluster so scattered false positives don't inflate the box
-    pts = xyz[hit]
-    w = (activation[hit] * opacity[hit]).unsqueeze(-1)
-    keep_c = torch.ones(pts.shape[0], dtype=torch.bool, device="cuda")
-    for _ in range(5):
-        centroid = (pts[keep_c] * w[keep_c]).sum(0) / w[keep_c].sum()
-        d = (pts - centroid).norm(dim=-1)
-        sigma = d[keep_c].square().mean().sqrt()
-        keep_c = d < 2.0 * sigma
-    lo = pts[keep_c].min(dim=0).values
-    hi = pts[keep_c].max(dim=0).values
-    print(f"3D centroid: {centroid.cpu().numpy().round(4).tolist()} "
-          f"({int(keep_c.sum())} of {n_hit} in dominant cluster)")
-    print(f"3D bbox: min {lo.cpu().numpy().round(4).tolist()} max {hi.cpu().numpy().round(4).tolist()}")
-
-    # --- visualization exports ---
     keep = opacity > args.opacity_min
     xyz_np = xyz[keep].cpu().numpy()
-    act_np = activation[keep].cpu().numpy()
-    hit_np = hit[keep].cpu().numpy()
     base = (rgb[keep].cpu().numpy() * 0.35 + 0.45) * 255.0  # desaturated scene
-    heat = cm.turbo(np.clip((act_np - args.threshold) / max(1e-6, 1 - args.threshold), 0, 1))[:, :3] * 255.0
-    colors = np.where(hit_np[:, None], heat, base).astype(np.uint8)
-
     out_dir = os.path.join(args.model_path, "localize_3d")
     os.makedirs(out_dir, exist_ok=True)
-    tag = args.img_label.replace(" ", "_")
-    stats = {"count": n_hit, "centroid": centroid.cpu().numpy()}
 
-    # bird-eye view (top-down, x-z plane; COLMAP/3DGS y points down) with the 3D bbox
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Rectangle
-    bev_scene = xyz_np[~hit_np]
-    bev_hit = pts[keep_c].cpu().numpy()
-    fig, ax = plt.subplots(figsize=(8, 8))
-    sub = np.random.default_rng(0).choice(bev_scene.shape[0], min(200000, bev_scene.shape[0]), replace=False)
-    ax.scatter(bev_scene[sub, 0], bev_scene[sub, 2], s=0.3, c="0.75", linewidths=0, rasterized=True)
-    ax.scatter(bev_hit[:, 0], bev_hit[:, 2], s=0.6, c=act_np[hit_np][keep_c.cpu().numpy()],
-               cmap="turbo", vmin=args.threshold, vmax=1.0, linewidths=0)
-    lo_np, hi_np = lo.cpu().numpy(), hi.cpu().numpy()
-    ax.add_patch(Rectangle((lo_np[0], lo_np[2]), hi_np[0] - lo_np[0], hi_np[2] - lo_np[2],
-                           fill=False, edgecolor="red", linewidth=1.5))
-    c_np = centroid.cpu().numpy()
-    ax.plot(c_np[0], c_np[2], "r+", markersize=12, markeredgewidth=2)
-    ax.set_aspect("equal")
-    # zoom to the object with context (unbounded scenes have background floaters far away)
-    half = max(float(hi_np[0] - lo_np[0]), float(hi_np[2] - lo_np[2])) * 1.8
-    ax.set_xlim(c_np[0] - half, c_np[0] + half)
-    ax.set_ylim(c_np[2] - half, c_np[2] + half)
-    ax.set_xlabel("x")
-    ax.set_ylabel("z")
-    ax.set_title(f'bird-eye view: "{args.img_label}" ({int(keep_c.sum())} Gaussians, thr {args.threshold})')
-    bev_path = os.path.join(out_dir, f"{tag}_bev.png")
-    fig.savefig(bev_path, dpi=150, bbox_inches="tight")
-    print(f"wrote {bev_path}")
+    for qi, query in enumerate(args.img_label):
+        # --- the 3D-native query: CLIP scoring against every Gaussian, no rasterization ---
+        torch.cuda.synchronize()
+        t0 = time.time()
+        activation = torch.zeros(codes.shape[0], device="cuda")
+        activation[valid] = clip_model.get_activation(embeds, qi).squeeze(-1)
+        torch.cuda.synchronize()
+        query_time = time.time() - t0
 
-    if not args.skip_ply:
-        ply_path = os.path.join(out_dir, f"{tag}.ply")
-        write_ply(ply_path, xyz_np, colors)
-        print(f"wrote {ply_path} ({xyz_np.shape[0]} points)")
+        hit = (activation > args.threshold) & (opacity > args.opacity_min)
+        n_hit = int(hit.sum())
+        print(f"\nquery '{query}': scored {int(valid.sum())} Gaussians in {query_time*1000:.1f} ms "
+              f"(no rasterization), {n_hit} above threshold {args.threshold}")
+        if n_hit == 0:
+            print("  no Gaussians activated — lower --threshold")
+            continue
 
-    if not args.skip_html:
-        if xyz_np.shape[0] > args.html_points:
-            rest = np.where(~hit_np)[0]
-            sub = np.random.default_rng(0).choice(rest, args.html_points - n_hit, replace=False)
-            sel = np.concatenate([np.where(hit_np)[0], sub])
-        else:
-            sel = np.arange(xyz_np.shape[0])
-        html_path = os.path.join(out_dir, f"{tag}.html")
-        write_html(html_path, xyz_np[sel], colors[sel], hit_np[sel], args.img_label, stats)
-        print(f"wrote {html_path} ({sel.shape[0]} points)")
+        # sigma-clip to the dominant cluster so scattered false positives don't inflate the box
+        pts = xyz[hit]
+        w = (activation[hit] * opacity[hit]).unsqueeze(-1)
+        keep_c = torch.ones(pts.shape[0], dtype=torch.bool, device="cuda")
+        for _ in range(5):
+            centroid = (pts[keep_c] * w[keep_c]).sum(0) / w[keep_c].sum()
+            d = (pts - centroid).norm(dim=-1)
+            sigma = d[keep_c].square().mean().sqrt()
+            keep_c = d < 2.0 * sigma
+        lo = pts[keep_c].min(dim=0).values
+        hi = pts[keep_c].max(dim=0).values
+        print(f"  3D centroid: {centroid.cpu().numpy().round(4).tolist()} "
+              f"({int(keep_c.sum())} of {n_hit} in dominant cluster)")
+        print(f"  3D bbox: min {lo.cpu().numpy().round(4).tolist()} max {hi.cpu().numpy().round(4).tolist()}")
+
+        # --- visualization exports ---
+        act_np = activation[keep].cpu().numpy()
+        hit_np = hit[keep].cpu().numpy()
+        cluster_np = keep_c.cpu().numpy()
+        heat = cm.turbo(np.clip((act_np - args.threshold) / max(1e-6, 1 - args.threshold), 0, 1))[:, :3] * 255.0
+        colors = np.where(hit_np[:, None], heat, base).astype(np.uint8)
+
+        tag = query.replace(" ", "_")
+        stats = {"count": n_hit, "centroid": centroid.cpu().numpy()}
+        bev_path = os.path.join(out_dir, f"{tag}_bev.png")
+        write_bev(bev_path, query, args.threshold, xyz_np, hit_np, act_np, cluster_np,
+                  lo.cpu().numpy(), hi.cpu().numpy(), centroid.cpu().numpy())
+        print(f"  wrote {bev_path}")
+
+        if not args.skip_ply:
+            ply_path = os.path.join(out_dir, f"{tag}.ply")
+            write_ply(ply_path, xyz_np, colors)
+            print(f"  wrote {ply_path} ({xyz_np.shape[0]} points)")
+
+        if not args.skip_html:
+            if xyz_np.shape[0] > args.html_points:
+                rest = np.where(~hit_np)[0]
+                sub = np.random.default_rng(0).choice(rest, max(0, args.html_points - n_hit), replace=False)
+                sel = np.concatenate([np.where(hit_np)[0], sub])
+            else:
+                sel = np.arange(xyz_np.shape[0])
+            html_path = os.path.join(out_dir, f"{tag}.html")
+            write_html(html_path, xyz_np[sel], colors[sel], hit_np[sel], query, stats)
+            print(f"  wrote {html_path} ({sel.shape[0]} points)")
