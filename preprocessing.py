@@ -21,8 +21,6 @@ try:
 except ImportError:
     assert False, "open_clip is not installed, install it with `pip install open-clip-torch`"
 
-from CLIP.clip import clip
-
 @dataclass
 class OpenCLIPNetworkConfig:
     _target: Type = field(default_factory=lambda: OpenCLIPNetwork)

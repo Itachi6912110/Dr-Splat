@@ -10,4 +10,4 @@ release
 *.png
 *.jpg
 *.out
-shells
+shellsckpts/*.pth
