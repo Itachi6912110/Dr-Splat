@@ -10,4 +10,5 @@ release
 *.png
 *.jpg
 *.out
-shellsckpts/*.pth
+shells
+ckpts/*.pth
